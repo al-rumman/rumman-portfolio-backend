@@ -1,21 +1,36 @@
 from django.core.cache import cache
 from django.db.models import Count, F, Q
 from django.db.models.deletion import ProtectedError
-from django_filters.rest_framework import CharFilter, DjangoFilterBackend, FilterSet
+from django_filters.rest_framework import (
+    BooleanFilter,
+    CharFilter,
+    DjangoFilterBackend,
+    FilterSet,
+)
 from rest_framework import viewsets
+from rest_framework.decorators import action
 from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from .models import Category, Post, Tag
+from portfolio.permissions import IsOwner
+
+from .models import Category, Comment, ContactMessage, Post, PostLike, Tag
 from .serializers import (
     CategorySerializer,
+    CommentAdminSerializer,
+    CommentCreateSerializer,
+    CommentPublicSerializer,
+    ContactAdminSerializer,
+    ContactCreateSerializer,
     PostDetailSerializer,
     PostListSerializer,
     PostWriteSerializer,
     TagSerializer,
 )
+from .throttles import CommentThrottle, ContactThrottle, LikeThrottle
 
 VIEW_COOLDOWN = 60 * 30  # ekoi visitor 30 minute e 1 bar-i view count korbe
 
@@ -55,6 +70,14 @@ class TagViewSet(viewsets.ModelViewSet):
 
 class PostPagination(PageNumberPagination):
     page_size = 6
+
+
+class CommentPagination(PageNumberPagination):
+    page_size = 10
+
+
+class ContactPagination(PageNumberPagination):
+    page_size = 10
 
 
 class PostFilter(FilterSet):
@@ -110,6 +133,14 @@ class PostViewSet(viewsets.ModelViewSet):
             return PostDetailSerializer
         return PostWriteSerializer
 
+    def get_throttles(self):
+        throttles = super().get_throttles()
+        if self.action == 'like':
+            throttles.append(LikeThrottle())
+        elif self.action == 'comments' and self.request.method == 'POST':
+            throttles.append(CommentThrottle())
+        return throttles
+
     def perform_create(self, serializer):
         serializer.save(author=self.request.user)
 
@@ -132,3 +163,100 @@ class PostViewSet(viewsets.ModelViewSet):
         if cache.add(key, 1, timeout=VIEW_COOLDOWN):
             Post.objects.filter(pk=post.pk).update(views_count=F('views_count') + 1)
             post.refresh_from_db(fields=['views_count'])
+
+    @action(detail=True, methods=['post'], permission_classes=[AllowAny])
+    def like(self, request, slug=None):
+        """Toggle like. X-Visitor-Id header lagbe."""
+        post = self.get_object()
+        visitor_id = request.headers.get('X-Visitor-Id', '').strip()
+        if not visitor_id:
+            return Response(
+                {'detail': 'X-Visitor-Id header is required.'}, status=400
+            )
+        if len(visitor_id) > 64:
+            return Response({'detail': 'X-Visitor-Id is too long.'}, status=400)
+
+        like, created = PostLike.objects.get_or_create(
+            post=post,
+            visitor_id=visitor_id,
+            defaults={'ip_address': request.META.get('REMOTE_ADDR')},
+        )
+        if not created:
+            like.delete()
+        return Response({'liked': created, 'likes_count': post.likes.count()})
+
+    @action(detail=True, methods=['get', 'post'], permission_classes=[AllowAny])
+    def comments(self, request, slug=None):
+        post = self.get_object()
+
+        if request.method == 'POST':
+            serializer = CommentCreateSerializer(
+                data=request.data, context={'post': post}
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save(post=post, is_approved=False)
+            return Response(
+                {'detail': 'Your comment is awaiting approval.'}, status=201
+            )
+
+        qs = post.comments.filter(is_approved=True, parent__isnull=True).order_by(
+            '-created_at'
+        )
+        paginator = CommentPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        data = CommentPublicSerializer(page, many=True).data
+        return paginator.get_paginated_response(data)
+
+
+class CommentFilter(FilterSet):
+    is_approved = BooleanFilter()
+    post = CharFilter(field_name='post__slug')
+
+    class Meta:
+        model = Comment
+        fields = []
+
+
+class CommentViewSet(viewsets.ModelViewSet):
+    """Owner-only moderation list."""
+    queryset = Comment.objects.select_related('post').order_by(
+        'is_approved', '-created_at'
+    )
+    serializer_class = CommentAdminSerializer
+    permission_classes = [IsOwner]
+    pagination_class = CommentPagination
+    http_method_names = ['get', 'patch', 'delete', 'head', 'options']
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = CommentFilter
+
+
+class ContactViewSet(viewsets.ModelViewSet):
+    queryset = ContactMessage.objects.all()
+    pagination_class = ContactPagination
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['is_read']
+
+    def get_permissions(self):
+        if self.action == 'create':
+            return [AllowAny()]
+        return [IsOwner()]
+
+    def get_throttles(self):
+        throttles = super().get_throttles()
+        if self.action == 'create':
+            throttles.append(ContactThrottle())
+        return throttles
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return ContactCreateSerializer
+        return ContactAdminSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            {'detail': 'Thanks! Your message has been sent.'}, status=201
+        )

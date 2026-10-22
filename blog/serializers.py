@@ -2,7 +2,7 @@ from rest_framework import serializers
 
 from portfolio.serializers import validate_image
 
-from .models import Category, Post, Tag
+from .models import Category, Comment, ContactMessage, Post, Tag
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -133,3 +133,99 @@ class PostWriteSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         return PostDetailSerializer(instance, context=self.context).data
+
+
+class CommentCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Comment
+        fields = ('name', 'email', 'website', 'content', 'parent')
+
+    def validate_name(self, value):
+        value = value.strip()
+        if len(value) < 2:
+            raise serializers.ValidationError('Name must be at least 2 characters.')
+        return value
+
+    def validate_content(self, value):
+        value = value.strip()
+        if not 5 <= len(value) <= 1000:
+            raise serializers.ValidationError(
+                'Comment must be between 5 and 1000 characters.'
+            )
+        return value
+
+    def validate_parent(self, value):
+        post = self.context['post']
+        if value is not None:
+            if value.post_id != post.pk:
+                raise serializers.ValidationError(
+                    'Parent comment belongs to a different post.'
+                )
+            if value.parent_id is not None:
+                raise serializers.ValidationError(
+                    'You can only reply to a top-level comment.'
+                )
+            if not value.is_approved:
+                raise serializers.ValidationError(
+                    'You cannot reply to a comment that is not approved.'
+                )
+        return value
+
+
+class ReplySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Comment
+        fields = ('id', 'name', 'website', 'content', 'created_at')
+
+
+class CommentPublicSerializer(serializers.ModelSerializer):
+    """Public API: email kokhono return hoy na."""
+    replies = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Comment
+        fields = ('id', 'name', 'website', 'content', 'created_at', 'replies')
+
+    def get_replies(self, obj):
+        qs = obj.replies.filter(is_approved=True).order_by('created_at')
+        return ReplySerializer(qs, many=True).data
+
+
+class CommentAdminSerializer(serializers.ModelSerializer):
+    post_slug = serializers.CharField(source='post.slug', read_only=True)
+    post_title = serializers.CharField(source='post.title', read_only=True)
+
+    class Meta:
+        model = Comment
+        fields = (
+            'id', 'post_slug', 'post_title', 'name', 'email', 'website',
+            'content', 'parent', 'is_approved', 'created_at',
+        )
+        read_only_fields = ('name', 'email', 'website', 'content', 'parent', 'created_at')
+
+
+class ContactCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ContactMessage
+        fields = ('name', 'email', 'subject', 'message')
+
+    def validate_name(self, value):
+        value = value.strip()
+        if len(value) < 2:
+            raise serializers.ValidationError('Name must be at least 2 characters.')
+        return value
+
+    def validate_message(self, value):
+        value = value.strip()
+        if not 10 <= len(value) <= 2000:
+            raise serializers.ValidationError(
+                'Message must be between 10 and 2000 characters.'
+            )
+        return value
+
+
+class ContactAdminSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ContactMessage
+        fields = '__all__'
+        read_only_fields = ('name', 'email', 'subject', 'message', 'created_at')
